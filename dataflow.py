@@ -1,64 +1,56 @@
-from bytewax.dataflow import Dataflow
-
-flow = Dataflow()
-
-from bytewax.connectors.files import FileInput
-
-flow.input("input", FileInput("data/cart-join.json"))
-
 import json
+from dataclasses import dataclass, field
+from bytewax.dataflow import Dataflow
+from bytewax import operators as op
+from bytewax.connectors.stdio import StdOutSink
+from bytewax.connectors.files import FileSource
+from bytewax.testing import run_main
+
+def safe_deserialize(data):
+    try:
+        event = json.loads(data)
+        if "user_id" in event and "type" in event and "order_id" in event:
+            return (event['user_id'], event)  # Return as (key, value) pair
+    except json.JSONDecodeError:
+        pass
+    print(f"Skipping invalid data: {data}")
+    return None
+
+@dataclass
+class ShoppingCartState:
+    unpaid_order_ids: dict = field(default_factory=dict)
+    paid_order_ids: list = field(default_factory=list)
+
+    def update(self, event):
+        order_id = event["order_id"]
+        if event["type"] == "order":
+            self.unpaid_order_ids[order_id] = event
+        elif event["type"] == "payment":
+            if order_id in self.unpaid_order_ids:
+                self.paid_order_ids.append(self.unpaid_order_ids.pop(order_id))
+
+    def summarize(self):
+        return {
+            "paid_order_ids": [order["order_id"] for order in self.paid_order_ids],
+            "unpaid_order_ids": list(self.unpaid_order_ids.keys())
+        }
+
+def state_manager(state, value):
+    if state is None:
+        state = ShoppingCartState()  
+    state.update(value)
+    return state, state.summarize()  
 
 
-def deserialize(s):
-    return [json.loads(s)]
+flow = Dataflow("shopping-cart-joiner")
+input_data = op.input("input", flow, FileSource("data/cart-join.json"))
+deserialize_data = op.map("deserialize", input_data, safe_deserialize)
+filter_valid = op.filter("filter_valid", deserialize_data, lambda x: x is not None)
+joined_data = op.stateful_map("joiner", filter_valid, state_manager)
+
+formatted_output = op.map("format_output", joined_data, lambda x: f"Final summary for user {x[0]}: {x[1]}")
+op.output("output", formatted_output, StdOutSink())
 
 
-def fixed_deserialize(s):
-    if s.startswith("FAIL"):  # Fix the bug.
-        return []
-    else:
-        return [json.loads(s)]
 
 
-flow.flat_map(deserialize)
-
-
-def key_off_user_id(event):
-    return event["user_id"], event
-
-
-flow.map(key_off_user_id)
-
-
-def build_state():
-    return {"unpaid_order_ids": [], "paid_order_ids": []}
-
-
-def joiner(state, event):
-    e_type = event["type"]
-    order_id = event["order_id"]
-    if e_type == "order":
-        state["unpaid_order_ids"].append(order_id)
-    elif e_type == "payment":
-        state["unpaid_order_ids"].remove(order_id)
-        state["paid_order_ids"].append(order_id)
-    return state, state
-
-
-flow.stateful_map("joiner", build_state, joiner)
-
-
-def format_output(user_id__joined_state):
-    user_id, joined_state = user_id__joined_state
-    return {
-        "user_id": user_id,
-        "paid_order_ids": joined_state["paid_order_ids"],
-        "unpaid_order_ids": joined_state["unpaid_order_ids"],
-    }
-
-
-flow.map(format_output)
-
-from bytewax.connectors.stdio import StdOutput
-
-flow.output("output", StdOutput())
