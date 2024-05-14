@@ -1,86 +1,55 @@
+import json
 from dataclasses import dataclass, field
 from bytewax.dataflow import Dataflow
 from bytewax import operators as op
-from bytewax.connectors.files import FileSource
 from bytewax.connectors.stdio import StdOutSink
+from bytewax.connectors.files import FileSource
 from bytewax.testing import run_main
 
-import json
-
-def deserialize(data):
+def safe_deserialize(data):
     try:
-        return [json.loads(data)]  # Ensure output is iterable
+        event = json.loads(data)
+        if "user_id" in event and "type" in event and "order_id" in event:
+            return (event['user_id'], event)  # Return as (key, value) pair
     except json.JSONDecodeError:
-        # Log error and return an empty list to signify a failed parse
-        print(f"Failed to decode JSON: {data}")
-        return []
-    except ValueError:
-        # Catch non-JSON lines and ignore them
-        return []
+        pass
+    print(f"Skipping invalid data: {data}")
+    return None
 
-def fixed_deserialize(s):
-    if s.startswith("FAIL"):  # Fix the bug.
-        return []
-    else:
-        return [json.loads(s)]
-    
-def safe_key_off_user_id(event):
-    if event and isinstance(event, dict) and "user_id" in event:
-        return (event["user_id"], event)
-    return None 
+@dataclass
+class ShoppingCartState:
+    unpaid_order_ids: dict = field(default_factory=dict)
+    paid_order_ids: list = field(default_factory=list)
 
+    def update(self, event):
+        order_id = event["order_id"]
+        if event["type"] == "order":
+            self.unpaid_order_ids[order_id] = event
+        elif event["type"] == "payment":
+            if order_id in self.unpaid_order_ids:
+                self.paid_order_ids.append(self.unpaid_order_ids.pop(order_id))
 
-def build_state():
-    return {"unpaid_order_ids": [], "paid_order_ids": []}
+    def summarize(self):
+        return {
+            "paid_order_ids": [order["order_id"] for order in self.paid_order_ids],
+            "unpaid_order_ids": list(self.unpaid_order_ids.keys())
+        }
 
-def joiner(state, event):
+def state_manager(state, value):
     if state is None:
-        state = build_state()
-
-    e_type = event.get("type")
-    order_id = event.get("order_id")
-
-    print(e_type, order_id)
-
-    if e_type == "order":
-        if order_id not in state["unpaid_order_ids"]:
-            state["unpaid_order_ids"].append(order_id)
-    elif e_type == "payment":
-        if order_id in state["unpaid_order_ids"]:
-            state["unpaid_order_ids"].remove(order_id)
-            state["paid_order_ids"].append(order_id)
-        else:
-            print(f"No matching unpaid order found for payment ID: {order_id}")
-
-    return state, event
-
-
-def inspect_final_state(user_id, state_event):
-    print(f"Final state for user {user_id}: {state_event}")
-
-
-def format_output(user_id__joined_state):
-    user_id, joined_state = user_id__joined_state
-    paid_order_ids = joined_state.get("paid_order_ids", [])
-    unpaid_order_ids = joined_state.get("unpaid_order_ids", [])
-    return {
-        "user_id": user_id,
-        "paid_order_ids": paid_order_ids,
-        "unpaid_order_ids": unpaid_order_ids,
-    }
+        state = ShoppingCartState()  
+    state.update(value)
+    return state, state.summarize()  
 
 
 flow = Dataflow("shopping-cart-joiner")
 input_data = op.input("input", flow, FileSource("data/cart-join.json"))
-deserialize_data = op.flat_map("deserialize", input_data, deserialize)
-get_user_id = op.map("get_user_id", deserialize_data, safe_key_off_user_id)
-join_data = op.stateful_map("joiner", get_user_id, joiner)
+deserialize_data = op.map("deserialize", input_data, safe_deserialize)
+filter_valid = op.filter("filter_valid", deserialize_data, lambda x: x is not None)
+joined_data = op.stateful_map("joiner", filter_valid, state_manager)
 
-formatted_data = op.map("format_output", join_data, format_output)
-
-output = op.output("output", formatted_data, StdOutSink())
-
-
+formatted_output = op.map("format_output", joined_data, lambda x: f"Final summary for user {x[0]}: {x[1]}")
+op.output("output", formatted_output, StdOutSink())
 
 
 
